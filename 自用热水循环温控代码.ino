@@ -12,8 +12,8 @@
 #define RELAY_PIN 5
 
 // 网络配置
-const char *ssid = "Zhou";
-const char *password = "18601982023";
+const char *ssid = "wifi";
+const char *password = "密码";
 
 // 工作时间段结构体（以当天分钟数表示）
 struct TimePeriod {
