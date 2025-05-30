@@ -14,8 +14,8 @@
 #define ONE_WIRE_BUS 4
 
 // 网络配置
-const char *ssid = "Zhou";
-const char *password = "18601982023";
+const char *ssid = "wifi";
+const char *password = "wifi密码";
 const char *mqtt_server = "192.168.2.1";
 const int mqtt_port = 1883;
 const char *mqtt_user = "admin";
