@@ -12,8 +12,8 @@
 #define RELAY_PIN 5
 
 // 网络配置
-const char *ssid = "wifi";
-const char *password = "密码";
+const char *ssid = "WIFI";
+const char *password = "WIFI";
 
 // 工作时间段结构体（以当天分钟数表示）
 struct TimePeriod {
@@ -24,8 +24,8 @@ struct TimePeriod {
 
 // 系统参数结构体
 struct SystemParams {
-  float targetTemp = 30.0;
-  float hysteresis = 5.0;
+  float targetTemp = 35.0;  // 默认目标温度35°C
+  float hysteresis = 5.0;   // 默认滞后值5°C
   bool relayState = false;
   bool modified = false;
   unsigned long maxRunDurationMinutes = 5;
@@ -38,7 +38,7 @@ OneWire oneWire(DS18B20_PIN);
 DallasTemperature sensors(&oneWire);
 ESP8266WebServer server(80);
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "ntp1.aliyun.com", 8 * 3600, 3600000);  // 时区+8，1小时同步一次
+NTPClient timeClient(ntpUDP, "192.168.2.1", 28800, 3600000); // 路由器NTP，无时区偏移，1小时同步
 SystemParams params;
 
 // 全局变量
@@ -47,13 +47,19 @@ bool inWaitPeriod = false;
 bool manualMode = false;
 float lastValidTemp = 25.0;
 String protectionEndTime = "";  // 保护结束时间
+unsigned long lastCycleTime = 0;  // 循环控制时间戳
+bool inCycleRunning = false;       // 是否在运行阶段
+bool tempConversionStarted = false; // 异步温度请求标志
+unsigned long tempRequestTime = 0;  // 温度请求时间戳
+bool heatingEnabled = false;        // 跟踪加热状态
+uint8_t tempLogCounter = 0;        // 温度日志计数器
 
 // 读取温度，同时保证数据有效
 float readValidTemperature() {
   static float lastValid = 25.0;
   float temp = sensors.getTempCByIndex(0);
   if (temp <= -127.0 || temp > 125.0) {
-    Serial.println("温度传感器异常，使用最后有效值");
+    Serial.println(F("温度传感器异常，使用最后有效值"));
     return lastValid;
   }
   lastValid = temp;
@@ -63,7 +69,6 @@ float readValidTemperature() {
 
 // 判断是否处于工作时间段
 bool isWithinWorkingPeriod() {
-  // 如果没有任何时间段启用，则默认允许工作
   bool anyEnabled = false;
   for (int i = 0; i < 4; i++) {
     if (params.periods[i].enabled) {
@@ -80,7 +85,6 @@ bool isWithinWorkingPeriod() {
       continue;
     int start = params.periods[i].start;
     int end = params.periods[i].end;
-    // 支持跨午夜
     if (start <= end) {
       if (currentMinutes >= start && currentMinutes < end)
         return true;
@@ -112,26 +116,25 @@ void loop() {
   server.handleClient();
   updateSystemTime();
 
-  // 定期更新温度（无论手动还是自动模式）
+  // 异步温度更新
   static unsigned long lastTempUpdate = 0;
-  if (millis() - lastTempUpdate >= 1000) {  // 每秒更新一次
-    sensors.requestTemperatures();          // 发起温度请求
-    while (!sensors.isConversionComplete()) {
-      delay(10);  // 等待转换完成
-    }
-
-    lastTempUpdate = millis();                 // 更新时间戳
-    lastValidTemp = readValidTemperature();    // 读取有效的温度值
-    //Serial.println(String(lastValidTemp, 1));  // 输出温度，保留2位小数
-  }
-
-  // 自动重连 WiFi
-  static unsigned long lastWiFiCheck = 0;
-  if (millis() - lastWiFiCheck > 10000) {
-    lastWiFiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi已断开，尝试重新连接...");
-      connectWiFi();
+  if (millis() - lastTempUpdate >= 200) {  // 每200ms检查
+    if (!tempConversionStarted) {
+      sensors.requestTemperatures();  // 发起温度请求
+      tempConversionStarted = true;
+      tempRequestTime = millis();
+    } else if (millis() - tempRequestTime >= 100) {  // 等待94ms+余量
+      if (sensors.isConversionComplete()) {
+        lastValidTemp = readValidTemperature();
+        tempConversionStarted = false;
+        lastTempUpdate = millis();
+        // 每10次（2秒）记录一次温度
+        if (++tempLogCounter >= 10) {
+          Serial.print(F("Temp: "));
+          Serial.println(lastValidTemp, 1);
+          tempLogCounter = 0;
+        }
+      }
     }
   }
 
@@ -140,10 +143,8 @@ void loop() {
     checkTemperature();
   }
 
-  delay(100);  // 保持短延时，防止任务阻塞
+  delay(50);  // 缩短延时，提高响应性
 }
-
-
 
 // 初始化引脚
 void pinSetup() {
@@ -154,24 +155,24 @@ void pinSetup() {
 // 初始化温度传感器
 void initTemperatureSensor() {
   sensors.begin();
-  sensors.setResolution(9); // 温控位数 9位93.75ms 10位187.5ms 11位375ms  12位750ms
+  sensors.setResolution(9); // 9位分辨率，93.75ms
 }
 
 void connectWiFi() {
-  Serial.println("开始连接WiFi...");
+  Serial.println(F("开始连接WiFi..."));
   WiFi.begin(ssid, password);
   unsigned long startTime = millis();
 
   while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
-    delay(10);      // 短暂等待以避免阻塞太久
-    ESP.wdtFeed();  // 喂狗防止重启
+    delay(10);
+    ESP.wdtFeed();
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi连接成功，IP地址: ");
+    Serial.print(F("WiFi连接成功，IP: "));
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("WiFi连接失败");
+    Serial.println(F("WiFi连接失败"));
   }
 }
 
@@ -186,60 +187,100 @@ void initWebServer() {
 
 // 时间同步函数
 bool syncTime() {
-  const char *ntpServers[] = {
-    "ntp1.aliyun.com",
-    "ntp.ntsc.ac.cn",
-    "cn.ntp.org.cn"
-  };
-  Serial.println("开始时间同步...");
-  for (int i = 0; i < sizeof(ntpServers) / sizeof(ntpServers[0]); i++) {
-    timeClient.setPoolServerName(ntpServers[i]);
-    Serial.print("尝试服务器: ");
-    Serial.println(ntpServers[i]);
-    if (timeClient.forceUpdate()) {
-      setTime(timeClient.getEpochTime());
-      Serial.println("同步成功，当前时间: " + formatTime(now()));
-      return true;
-    }
-    delay(1000);
+  Serial.println(F("同步时间: 192.168.2.1"));
+  timeClient.setPoolServerName("192.168.2.1");
+  if (timeClient.forceUpdate()) {
+    setTime(timeClient.getEpochTime());
+    Serial.print(F("同步成功，时间: "));
+    Serial.println(formatTime(now()));
+    return true;
   }
-  Serial.println("所有NTP服务器同步失败，保持当前系统时间");
+  Serial.println(F("路由器NTP同步失败"));
   return false;
 }
 
-// 自动温控逻辑（含工作时间段判断）
+// 自动温控逻辑（3秒运行，7秒停止）
 void checkTemperature() {
-  // 如果不在工作时间段，则关闭继电器
   if (!isWithinWorkingPeriod()) {
     setRelay(false);
+    inCycleRunning = false;
+    inWaitPeriod = false;
+    relayStartTime = 0;
+    lastCycleTime = 0;
+    protectionEndTime = "";
+    heatingEnabled = false;
+    Serial.println(F("非工作时间，继电器关闭"));
     return;
   }
 
-  float currentTemp = lastValidTemp;  // 使用全局变量
+  float currentTemp = lastValidTemp;
+
+  // 更新加热状态
   if (currentTemp >= params.targetTemp) {
+    heatingEnabled = false;
+  } else if (currentTemp <= params.targetTemp - params.hysteresis) {
+    heatingEnabled = true;
+  }
+
+  if (!heatingEnabled) {
     setRelay(false);
+    inCycleRunning = false;
     inWaitPeriod = false;
     relayStartTime = 0;
+    lastCycleTime = 0;
     protectionEndTime = "";
-  } else if (currentTemp <= (params.targetTemp - params.hysteresis)) {
-    if (!inWaitPeriod) {
-      if (relayStartTime == 0) {
-        relayStartTime = millis();
-      }
+    Serial.println(F("温度高于阈值或等待滞后，继电器关闭"));
+    return;
+  }
+
+  // 加热启用，执行脉冲控制
+  if (!inWaitPeriod) {
+    if (relayStartTime == 0) {
+      relayStartTime = millis();
+    }
+
+    // 检查是否超过最大运行时间
+    if (millis() - relayStartTime > params.maxRunDurationMinutes * 60000UL) {
+      setRelay(false);
+      inWaitPeriod = true;
+      inCycleRunning = false;
+      lastCycleTime = 0;
+      relayStartTime = millis();
+      time_t endTime = now() + (params.restDurationMinutes * 60);
+      protectionEndTime = formatTime(endTime);
+      Serial.println(F("超过最大运行时间，进入保护"));
+      return;
+    }
+
+    // 3秒运行、7秒停止循环
+    unsigned long currentTime = millis();
+    if (!inCycleRunning) {
       setRelay(true);
-      if (millis() - relayStartTime > params.maxRunDurationMinutes * 60000UL) {
+      inCycleRunning = true;
+      lastCycleTime = currentTime;
+      Serial.print(F("循环开启，温度: "));
+      Serial.println(currentTemp, 1);
+    } else {
+      unsigned long elapsed = currentTime - lastCycleTime;
+      if (elapsed >= 11000) {  // 完整周期（3s+7s=10s）
+        lastCycleTime = currentTime;
+        setRelay(true);
+        Serial.print(F("循环开启，温度: "));
+        Serial.println(currentTemp, 1);
+      } else if (elapsed >= 4000) {  // 3秒运行后停止
         setRelay(false);
-        inWaitPeriod = true;
-        relayStartTime = millis();
-        time_t endTime = now() + (params.restDurationMinutes * 60);
-        protectionEndTime = formatTime(endTime);
       }
     }
   }
+
+  // 检查休息时间是否结束
   if (inWaitPeriod && (millis() - relayStartTime > params.restDurationMinutes * 60000UL)) {
     inWaitPeriod = false;
     relayStartTime = 0;
     protectionEndTime = "";
+    lastCycleTime = 0;
+    inCycleRunning = false;
+    Serial.println(F("休息期结束，恢复运行"));
   }
 }
 
@@ -249,8 +290,7 @@ void setRelay(bool state) {
   params.relayState = state;
 }
 
-// Web页面（动态添加工作时间段输入）
-// 美化后的 Web 页面（handleRoot函数）
+// Web页面
 void handleRoot() {
   String html = R"rawliteral(
   <html>
@@ -328,36 +368,32 @@ void handleRoot() {
         }
       </style>
       <script>
-          function updateData() {
-    fetch('/data').then(r => r.json()).then(data => {
-      document.getElementById('mode').innerText = data.mode;
-      document.getElementById('temp').innerText = data.temp;
-      const stateElem = document.getElementById('state');
-      stateElem.innerHTML = data.state + 
-        (data.nextRun !== "-" ? "<br>恢复时间: " + data.nextRun : "");
-        
-      // 根据状态改变文字颜色或背景色
-      if (data.state === "工作中") {
-        stateElem.style.color = "#4CAF50"; // 绿色表示工作中
-        stateElem.style.backgroundColor = "#e8f5e9"; // 背景颜色浅绿
-      } else if (data.state === "已停止") {
-        stateElem.style.color = "#FF9800"; // 橙色表示待机
-        stateElem.style.backgroundColor = "#fff3e0"; // 背景颜色浅橙
-      } else if (data.state === "保护中") {
-        stateElem.style.color = "#F44336"; // 红色表示错误
-        stateElem.style.backgroundColor = "#ffebee"; // 背景颜色浅红
-      } else {
-        stateElem.style.color = "#333"; // 默认颜色
-        stateElem.style.backgroundColor = "#fafafa"; // 默认背景色
-      }
-      
-      stateElem.setAttribute('data-state', data.state);
-      document.getElementById('time').innerText = data.time;
-      document.getElementById('modeBtn').innerText = data.modeBtn;
-      document.getElementById('workStatus').innerText = data.working;
-    });
-  }
-  setInterval(updateData, 2000);
+        function updateData() {
+          fetch('/data').then(r => r.json()).then(data => {
+            document.getElementById('mode').innerText = data.mode;
+            document.getElementById('temp').innerText = data.temp;
+            const stateElem = document.getElementById('state');
+            stateElem.innerHTML = data.state + 
+              (data.nextRun !== "-" ? "<br>恢复时间: " + data.nextRun : "");
+            if (data.state === "工作中") {
+              stateElem.style.color = "#4CAF50";
+              stateElem.style.backgroundColor = "#e8f5e9";
+            } else if (data.state === "已停止") {
+              stateElem.style.color = "#FF9800";
+              stateElem.style.backgroundColor = "#fff3e0";
+            } else if (data.state === "保护中") {
+              stateElem.style.color = "#F44336";
+              stateElem.style.backgroundColor = "#ffebee";
+            } else {
+              stateElem.style.color = "#333";
+              stateElem.style.backgroundColor = "#fafafa";
+            }
+            stateElem.setAttribute('data-state', data.state);
+            document.getElementById('time').innerText = data.time;
+            document.getElementById('workStatus').innerText = data.working;
+          });
+        }
+        setInterval(updateData, 2000);
         function toggleMode() {
           fetch('/toggle', { method: 'POST' })
             .then(r => r.text())
@@ -405,7 +441,6 @@ void handleRoot() {
           <h3>工作时间段 (最多4个)</h3>
   )rawliteral";
 
-  // 使用下拉选择，横向排列
   for (int i = 0; i < 4; i++) {
     int startHour = params.periods[i].start / 60;
     int startMin = params.periods[i].start % 60;
@@ -414,7 +449,6 @@ void handleRoot() {
     html += "<div class='time-period'>";
     html += "<label>时间段 " + String(i + 1) + ":</label> ";
     html += "<input type='checkbox' name='period" + String(i) + "_enabled' " + (params.periods[i].enabled ? "checked" : "") + "> 启用<br>";
-
     html += "<div class='time-row'>";
     html += "<label>开始时间:</label>";
     html += "<select name='period" + String(i) + "_start_hour'>";
@@ -427,8 +461,7 @@ void handleRoot() {
       html += "<option value='" + String(m) + "'" + (m == startMin ? " selected" : "") + ">" + (m < 10 ? "0" : "") + String(m) + "分</option>";
     }
     html += "</select>";
-    html += "</div>";  // end time-row
-
+    html += "</div>";
     html += "<div class='time-row'>";
     html += "<label>结束时间:</label>";
     html += "<select name='period" + String(i) + "_end_hour'>";
@@ -441,8 +474,7 @@ void handleRoot() {
       html += "<option value='" + String(m) + "'" + (m == endMin ? " selected" : "") + ">" + (m < 10 ? "0" : "") + String(m) + "分</option>";
     }
     html += "</select>";
-    html += "</div>";  // end time-row
-
+    html += "</div>";
     html += "</div>";
   }
 
@@ -456,7 +488,8 @@ void handleRoot() {
 
   server.send(200, "text/html; charset=UTF-8", html);
 }
-// 数据接口（增加工作时间状态）
+
+// 数据接口
 void handleData() {
   String json;
   json.reserve(300);
@@ -484,15 +517,14 @@ void handleData() {
   server.send(200, "application/json", json);
 }
 
-// 时间格式化函数
+// 时间格式化
 String formatTime(time_t timestamp) {
   String t = String(hour(timestamp)) + ":" + (minute(timestamp) < 10 ? "0" : "") + String(minute(timestamp)) + ":" + (second(timestamp) < 10 ? "0" : "") + String(second(timestamp));
   return t;
 }
 
-// 处理设置请求，包括温控参数及工作时间段
+// 处理设置请求
 void handleSet() {
-  // 目标温度校验
   if (server.hasArg("target")) {
     float newTemp = server.arg("target").toFloat();
     if (newTemp < 10 || newTemp > 90) {
@@ -502,7 +534,6 @@ void handleSet() {
     params.targetTemp = newTemp;
     params.modified = true;
   }
-  // 滞后值校验
   if (server.hasArg("hysteresis")) {
     float hyst = server.arg("hysteresis").toFloat();
     if (hyst < 1 || hyst > 20) {
@@ -512,7 +543,6 @@ void handleSet() {
     params.hysteresis = hyst;
     params.modified = true;
   }
-  // 最大运行时间校验
   if (server.hasArg("maxRun")) {
     int runTime = server.arg("maxRun").toInt();
     if (runTime < 1 || runTime > 1440) {
@@ -522,7 +552,6 @@ void handleSet() {
     params.maxRunDurationMinutes = runTime;
     params.modified = true;
   }
-  // 休息时间校验
   if (server.hasArg("restTime")) {
     int restTime = server.arg("restTime").toInt();
     if (restTime < 1 || restTime > 1440) {
@@ -532,10 +561,9 @@ void handleSet() {
     params.restDurationMinutes = restTime;
     params.modified = true;
   }
-  // 工作时间段设置
   for (int i = 0; i < 4; i++) {
     String enabledArg = "period" + String(i) + "_enabled";
-    params.periods[i].enabled = server.hasArg(enabledArg);  // 如果复选框存在则为true
+    params.periods[i].enabled = server.hasArg(enabledArg);
     String startHourArg = "period" + String(i) + "_start_hour";
     String startMinArg = "period" + String(i) + "_start_min";
     String endHourArg = "period" + String(i) + "_end_hour";
@@ -566,18 +594,18 @@ void saveParamsToEEPROM() {
   params.crc = calculateCRC((uint8_t *)&params, sizeof(SystemParams) - sizeof(uint32_t));
   EEPROM.put(0, params);
   EEPROM.commit();
-  Serial.println("参数保存至EEPROM");
+  Serial.println(F("参数已保存至EEPROM"));
 }
 
 bool loadParamsFromEEPROM() {
   EEPROM.get(0, params);
   uint32_t crc = calculateCRC((uint8_t *)&params, sizeof(SystemParams) - sizeof(uint32_t));
   if (crc == params.crc) {
-    Serial.println("从EEPROM加载参数成功");
+    Serial.println(F("EEPROM参数加载成功"));
     return true;
   } else {
-    Serial.println("EEPROM数据校验失败，使用默认参数");
-    params = SystemParams();  // 重置为默认
+    Serial.println(F("EEPROM校验失败，使用默认参数"));
+    params = SystemParams();
     return false;
   }
 }
@@ -602,9 +630,9 @@ void updateSystemTime() {
   if (millis() - lastUpdate > 3600000 && WiFi.status() == WL_CONNECTED) {
     lastUpdate = millis();
     if (syncTime()) {
-      Serial.println("时间同步成功");
+      Serial.println(F("时间同步成功"));
     } else {
-      Serial.println("时间同步失败，继续使用当前时间");
+      Serial.println(F("时间同步失败"));
     }
   }
 }
@@ -616,10 +644,16 @@ void handleToggle() {
     inWaitPeriod = false;
     protectionEndTime = "";
     relayStartTime = 0;
-    setRelay(true);  // 手动模式默认开启
+    lastCycleTime = 0;
+    inCycleRunning = false;
+    heatingEnabled = false;
+    setRelay(true);
     server.send(200, "text/plain", "手动运行切换中……");
   } else {
     relayStartTime = 0;
+    lastCycleTime = 0;
+    inCycleRunning = false;
+    heatingEnabled = false;
     setRelay(false);
     server.send(200, "text/plain", "自动温控模式切换中……");
   }
