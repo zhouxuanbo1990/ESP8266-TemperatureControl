@@ -8,31 +8,33 @@
 #include <WiFiUdp.h>
 #include <TimeLib.h>
 #include <FS.h>
+#include <ArduinoJson.h>
 
 // 硬件配置
 #define RELAY_PIN 5
 #define ONE_WIRE_BUS 4
 
 // 网络配置
-const char *ssid = "wifi";
-const char *password = "wifi密码";
+const char *ssid = "****";
+const char *password = "****";
 const char *mqtt_server = "192.168.2.1";
-const int mqtt_port = 1883;
-const char *mqtt_user = "admin";
-const char *mqtt_password = "public";
-const char *ntp_server = "192.168.2.1";
+const int mqtt_port = *****;
+const char *mqtt_user = "***";
+const char *mqtt_password = "****";
+const char *ntp_server = "****";
 
 // MQTT 主题
 const char *deviceA_status_topic = "deviceA/status";
 const char *deviceB_status_topic = "deviceB/status";
+const char *deviceA_error_topic = "deviceA/error";
 
 // 日志相关
 const char *logFile = "/log.txt";
-const size_t maxLogSize = 20480;  // 最大日志大小20KB
+const size_t maxLogSize = 20480; // 20KB
 String logBuffer = "";
-const size_t maxBufferSize = 1024;  // 缓冲区最大1KB
+const size_t maxBufferSize = 1024; // 1KB
 unsigned long lastLogFlush = 0;
-const unsigned long logFlushInterval = 30000;  // 每30秒写入一次
+const unsigned long logFlushInterval = 30000; // 30秒
 
 struct TimePeriod {
   bool enabled = false;
@@ -53,7 +55,7 @@ struct SystemParams {
   bool pulseEnabled = false;
   unsigned long pulseOnMs = 5000;
   unsigned long pulseOffMs = 8000;
-  bool enableLogging = true;  // 日志开关，仅控制文件日志
+  bool enableLogging = true;
   TimePeriod periods[4] = {
     { false, 0, 0, 23, 59 },
     { false, 0, 0, 23, 59 },
@@ -63,7 +65,7 @@ struct SystemParams {
   uint32_t crc = 0;
 };
 
-// 全局 PROGMEM 变量
+// HTML 内容
 static const char html_part1[] PROGMEM = R"rawliteral(
 <html>
 <head>
@@ -118,7 +120,7 @@ static const char html_part1[] PROGMEM = R"rawliteral(
         sensorStatus.textContent = data.sensorStatus;
         sensorStatus.className = '';
         if(data.sensorStatus === '在线') sensorStatus.classList.add('sensor-online');
-        else if(data.sensorStatus === '离线') sensorStatus.classList.add('sensor-offline');
+        else if(data.sensorStatus === '离线/故障') sensorStatus.classList.add('sensor-offline');
         const nextRun = document.getElementById('next-run');
         nextRun.textContent = data.nextRun !== '-' ? '恢复时间: ' + data.nextRun : '';
         nextRun.className = data.nextRun !== '-' ? 'next-run' : '';
@@ -234,84 +236,83 @@ bool deviceBOnline = false;
 bool deviceBRelayState = false;
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastWiFiCheckTime = 0;
-unsigned long lastWiFiRetryTime = 0;
 unsigned long lastUpdate = 0;
 unsigned long lastDeviceBStatusTime = 0;
 unsigned long lastStatusUpdateTime = 0;
+
+// WiFi 非阻塞重连变量
+unsigned long lastWiFiAttemptTime = 0;
+const unsigned long wifiAttemptInterval = 5000;
+int wifiConnectionAttempts = 0;
+const int maxWiFiConnectionAttempts = 10;
+bool wifiInitialConnectionDone = false;
 unsigned long lastMqttCheckTime = 0;
 unsigned long lastDeviceCheckTime = 0;
 bool lastMqttConnectedState = false;
 bool lastDeviceBOnlineState = false;
-bool isFirstWiFiConnect = true;
-bool isFirstMqttConnect = true;
 const unsigned long reconnectInterval = 15000;
 const unsigned long wifiCheckInterval = 120000;
 const unsigned long wifiRetryInterval = 180000;
 const unsigned long mqttCheckInterval = 10000;
 const unsigned long statusUpdateInterval = 2000;
 const unsigned long deviceCheckInterval = 60000;
-static unsigned long lastTempCheck = 0;
-const unsigned long tempCheckInterval = 100;
-bool tempSensorFailed = false;        // DS18B20 是否故障
-uint8_t tempErrorCount = 0;           // 连续异常计数
-const uint8_t maxTempErrorCount = 5;  // 连续5次异常判为故障
+bool tempSensorFailed = false;
+uint8_t tempErrorCount = 0;
+const uint8_t maxTempErrorCount = 5;
 
-// 函数声明
-void pinSetup();
-void connectWiFi();
-void setupMQTT();
-void callback(char *topic, byte *payload, unsigned int length);
-void reconnect();
-void initWebServer();
-void saveParamsToEEPROM();
-void loadParamsFromEEPROM();
-uint32_t calculateCRC(uint8_t *data, size_t len);
-float readValidTemperature();
-void setRelay(bool state);
-void checkTemperature();
-void updateSystemTime();
-bool isWithinAutoModeWorkingPeriod();
-String formatTime(time_t t);
-void checkWiFiStatus();
-void checkMqttStatus();
-bool isDeviceBOnline(unsigned long timeout);
-void checkDeviceBStatus();
-String getLogTimestamp();
-void logEvent(const String &event);
-void flushLogBuffer();
-void initLog();
-void debugParams();
+// MQTT 非阻塞重连变量
+unsigned long lastMqttAttemptTime = 0;
+const unsigned long mqttAttemptInterval = 5000;
+int mqttConnectionAttempts = 0;
+const int maxMqttConnectionAttempts = 5;
+bool mqttInitialConnectionDone = false;
 
 void pinSetup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
 }
 
-void connectWiFi() {
-  Serial.println(F("开始连接WiFi..."));
-  logEvent(F("开始连接WiFi..."));
-  WiFi.begin(ssid, password);
-  unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
-    delay(10);
-    ESP.wdtFeed();
-  }
+void tryConnectWiFi(bool forceAttempt = false) {
   if (WiFi.status() == WL_CONNECTED) {
-    if (isFirstWiFiConnect) {
-      Serial.print(F("WiFi连接成功，IP: "));
+    wifiConnectionAttempts = 0;
+    if (!wifiInitialConnectionDone) {
+      String logMessage = F("WiFi首次连接成功，IP: ") + WiFi.localIP().toString();
+      Serial.print(F("WiFi首次连接成功，IP: "));
       Serial.println(WiFi.localIP());
       Serial.print(F("设备名称: DeviceA-"));
       Serial.println(ESP.getChipId());
-      logEvent(F("WiFi连接成功，IP: ") + WiFi.localIP().toString());
-      isFirstWiFiConnect = false;
+      logMessage += F("，设备名称: DeviceA-") + String(ESP.getChipId());
+      logEvent(logMessage);
+      wifiInitialConnectionDone = true;
     }
-    Serial.print(F("当前IP: "));
-    Serial.println(WiFi.localIP());
-    logEvent(F("WiFi连接成功，IP: ") + WiFi.localIP().toString());
-  } else {
-    Serial.println(F("WiFi连接失败"));
-    logEvent(F("WiFi连接失败"));
+    return;
   }
+
+  if (!forceAttempt && millis() - lastWiFiAttemptTime < wifiAttemptInterval) {
+    return;
+  }
+  lastWiFiAttemptTime = millis();
+
+  if (wifiConnectionAttempts >= maxWiFiConnectionAttempts) {
+    if (millis() - lastWiFiAttemptTime < wifiRetryInterval) {
+      return;
+    }
+    Serial.println(F("WiFi连接尝试已达最大次数，将等待较长时间后重试"));
+    logEvent(F("WiFi连接尝试已达最大次数，将等待较长时间后重试"));
+    wifiConnectionAttempts = 0;
+  }
+
+  Serial.print(F("尝试连接WiFi (第 "));
+  Serial.print(wifiConnectionAttempts + 1);
+  Serial.println(F(" 次)..."));
+  logEvent(F("尝试连接WiFi (第 ") + String(wifiConnectionAttempts + 1) + F(" 次)..."));
+
+  WiFi.begin(ssid, password);
+  wifiConnectionAttempts++;
+}
+
+void connectWiFi() {
+  tryConnectWiFi(true);
 }
 
 void setupMQTT() {
@@ -331,6 +332,8 @@ void callback(char *topic, byte *payload, unsigned int length) {
       deviceBOnline = true;
       lastDeviceBStatusTime = millis();
       deviceBRelayState = (message == "ON");
+      Serial.print(F("设备B状态更新: "));
+      Serial.println(message);
       if (deviceBOnline != lastDeviceBOnlineState) {
         lastDeviceBOnlineState = deviceBOnline;
         Serial.println(F("设备B上线"));
@@ -340,44 +343,70 @@ void callback(char *topic, byte *payload, unsigned int length) {
   }
 }
 
-void reconnect() {
-  if (millis() - lastReconnectAttempt < reconnectInterval) {
-    return;
-  }
+void tryConnectMQTT(bool forceAttempt = false) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("WiFi未连接，跳过MQTT连接"));
-    logEvent(F("WiFi未连接，跳过MQTT连接"));
-    lastReconnectAttempt = millis();
+    if (mqttConnectionAttempts > 0) {
+      Serial.println(F("WiFi未连接，MQTT连接尝试暂停"));
+      logEvent(F("WiFi未连接，MQTT连接尝试暂停"));
+    }
+    mqttConnectionAttempts = 0;
+    lastMqttAttemptTime = 0;
     return;
   }
-  Serial.println(F("尝试连接MQTT..."));
-  logEvent(F("尝试连接MQTT..."));
-  String clientId = "DeviceA-" + String(ESP.getChipId());
-  int attempt = 0;
-  for (int i = 0; i < 5; i++) {
-    attempt++;
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_password, deviceA_status_topic, 0, true, "OFF")) {
-      if (isFirstMqttConnect) {
-        Serial.println(F("MQTT连接正常"));
-        logEvent(F("MQTT连接正常"));
-        isFirstMqttConnect = false;
-      }
-      client.subscribe(deviceB_status_topic);
-      client.publish(deviceA_status_topic, params.relayState ? "ON" : "OFF", true);
-      Serial.println(F("订阅B状态并发布A状态"));
-      lastReconnectAttempt = 0;
+
+  if (client.connected()) {
+    mqttConnectionAttempts = 0;
+    if (!mqttInitialConnectionDone) {
+      Serial.println(F("MQTT首次连接成功"));
+      logEvent(F("MQTT首次连接成功"));
+      mqttInitialConnectionDone = true;
+    }
+    return;
+  }
+
+  if (!forceAttempt && millis() - lastMqttAttemptTime < mqttAttemptInterval) {
+    return;
+  }
+  lastMqttAttemptTime = millis();
+
+  if (mqttConnectionAttempts >= maxMqttConnectionAttempts) {
+    if (millis() - lastMqttAttemptTime < reconnectInterval) {
       return;
     }
-    Serial.print(F("第"));
-    Serial.print(attempt);
-    Serial.print(F("次失败，状态: "));
-    Serial.println(client.state());
-    logEvent(F("MQTT连接失败，第") + String(attempt) + F("次，状态: ") + String(client.state()));
-    delay(2000);
+    Serial.println(F("MQTT连接尝试已达最大次数，将等待较长时间后重试"));
+    logEvent(F("MQTT连接尝试已达最大次数，将等待较长时间后重试"));
+    mqttConnectionAttempts = 0;
   }
-  Serial.println(F("MQTT重连失败"));
-  logEvent(F("MQTT重连失败"));
-  lastReconnectAttempt = millis();
+
+  Serial.print(F("尝试连接MQTT (第 "));
+  Serial.print(mqttConnectionAttempts + 1);
+  Serial.println(F(" 次)..."));
+  logEvent(F("尝试连接MQTT (第 ") + String(mqttConnectionAttempts + 1) + F(" 次)..."));
+
+  String clientId = "DeviceA-" + String(ESP.getChipId());
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_password, deviceA_status_topic, 0, true, "OFF")) {
+    if (!mqttInitialConnectionDone) {
+      Serial.println(F("MQTT首次连接成功"));
+      logEvent(F("MQTT首次连接成功"));
+      mqttInitialConnectionDone = true;
+    } else {
+      Serial.println(F("MQTT重连成功"));
+      logEvent(F("MQTT重连成功"));
+    }
+    client.subscribe(deviceB_status_topic);
+    client.publish(deviceA_status_topic, params.relayState ? "ON" : "OFF", true);
+    Serial.println(F("订阅B状态并发布A状态"));
+    mqttConnectionAttempts = 0;
+  } else {
+    Serial.print(F("MQTT连接失败，状态: "));
+    Serial.println(client.state());
+    logEvent(F("MQTT连接失败，状态: ") + String(client.state()));
+    mqttConnectionAttempts++;
+  }
+}
+
+void reconnect() {
+  tryConnectMQTT(true);
 }
 
 void debugParams() {
@@ -448,20 +477,21 @@ void initWebServer() {
   });
 
   server.on("/data", HTTP_GET, []() {
+    DynamicJsonDocument doc(512);
     char tempBuf[10];
     snprintf(tempBuf, sizeof(tempBuf), "%.1f", lastValidTemp);
-    String json = "{";
-    json += "\"mode\":\"" + String(manualMode ? "手动运行" : "自动温控模式") + "\",";
-    json += "\"temp\":\"" + String(tempBuf) + "\",";
-    json += "\"state\":\"" + String(digitalRead(RELAY_PIN) ? "工作中" : (inWaitPeriod ? "保护中" : "已停止")) + "\",";
-    json += "\"nextRun\":\"" + String(inWaitPeriod ? protectionEndTime : "-") + "\",";
-    json += "\"time\":\"" + formatTime(now()) + "\",";
-    json += "\"working\":\"" + String(isWithinAutoModeWorkingPeriod() ? "在自动模式工作时间" : "非自动模式工作时间") + "\",";
-    json += "\"deviceBStatus\":\"" + String(deviceBOnline ? "在线" : "离线") + "\",";
-    json += "\"sensorStatus\":\"" + String(tempSensorFailed ? "离线" : "在线") + "\",";
-    json += "\"modeBtn\":\"" + String(manualMode ? "切换自动温控模式" : "切换手动运行") + "\"";
-    json += "}";
-    server.send(200, "application/json", json);
+    doc["mode"] = manualMode ? "手动运行" : "自动温控模式";
+    doc["temp"] = tempBuf;
+    doc["state"] = digitalRead(RELAY_PIN) ? "工作中" : (inWaitPeriod ? "保护中" : "已停止");
+    doc["nextRun"] = inWaitPeriod ? protectionEndTime : "-";
+    doc["time"] = formatTime(now());
+    doc["working"] = isWithinAutoModeWorkingPeriod() ? "在自动模式工作时间" : "非自动模式工作时间";
+    doc["deviceBStatus"] = deviceBOnline ? "在线" : "离线";
+    doc["sensorStatus"] = tempSensorFailed ? "离线/故障" : "在线";
+    doc["modeBtn"] = manualMode ? "切换自动温控模式" : "切换手动运行";
+    String jsonOutput;
+    serializeJson(doc, jsonOutput);
+    server.send(200, "application/json", jsonOutput);
     Serial.println(F("收到GET /data 请求并响应"));
   });
 
@@ -643,7 +673,6 @@ void saveParamsToEEPROM() {
   static SystemParams lastSavedParams;
   if (memcmp(&params, &lastSavedParams, sizeof(SystemParams)) == 0) {
     Serial.println(F("参数未更改，跳过EEPROM写入"));
-    logEvent(F("参数未更改，跳过EEPROM写入"));
     return;
   }
 
@@ -696,7 +725,6 @@ void loadParamsFromEEPROM() {
     debugParams();
   } else {
     Serial.println(F("EEPROM校验失败，初始化默认参数"));
-    logEvent(F("EEPROM校验失败，初始化默认参数"));
     params = SystemParams();
     saveParamsToEEPROM();
   }
@@ -704,27 +732,49 @@ void loadParamsFromEEPROM() {
 
 float readValidTemperature() {
   float temp = sensors.getTempCByIndex(0);
+  static int sensorRecoverCount = 0;
   if (temp <= -127.0 || temp > 125.0) {
     tempErrorCount++;
+    sensorRecoverCount = 0;
     if (!tempSensorFailed) {
       Serial.println(F("温度传感器偶发异常，读取值: ") + String(temp, 1));
       logEvent(F("温度传感器偶发异常，读取值: ") + String(temp, 1));
     }
     if (tempErrorCount >= maxTempErrorCount && !tempSensorFailed) {
       tempSensorFailed = true;
+      Serial.println(F("温度传感器故障，已进入保护状态"));
+      logEvent(F("温度传感器故障，已进入保护状态"));
+      if (client.connected()) {
+        client.publish(deviceA_error_topic, "TEMP_SENSOR_FAILED");
+      }
     }
     return lastValidTemp;
   }
-  if (tempErrorCount > 0 || tempSensorFailed) {
-    tempErrorCount = 0;
-    if (tempSensorFailed) {
+  if (tempSensorFailed) {
+    sensorRecoverCount++;
+    if (sensorRecoverCount >= 5) {
       tempSensorFailed = false;
+      tempErrorCount = 0;
+      Serial.println(F("温度传感器自动恢复，退出保护状态"));
+      logEvent(F("温度传感器自动恢复，退出保护状态"));
+      if (client.connected()) {
+        client.publish(deviceA_error_topic, "TEMP_SENSOR_RECOVERED");
+      }
+    }
+  } else {
+    sensorRecoverCount = 0;
+    tempErrorCount = 0;
+  }
+  if (abs(temp - lastPrintedTemp) >= 0.5 || lastPrintedTemp == -127.0) {
+    lastPrintedTemp = temp;
+    if (client.connected()) {
+      char tempBuf[10];
+      snprintf(tempBuf, sizeof(tempBuf), "%.1f", temp);
+      client.publish("deviceA/temperature", tempBuf);
+      Serial.println(F("温度更新: ") + String(temp, 1) + F("°C"));
     }
   }
   lastValidTemp = temp;
-  if (abs(temp - lastPrintedTemp) >= 0.5 || lastPrintedTemp == -127.0) {
-    lastPrintedTemp = temp;
-  }
   return temp;
 }
 
@@ -788,6 +838,10 @@ void checkTemperature() {
       protectionEndTime = "";
       heatingEnabled = false;
       lastRelayChange = millis();
+      if (client.connected()) {
+        client.publish(deviceA_error_topic, "TEMP_SENSOR_FAILED", true);
+      }
+      logEvent(F("温度传感器故障，已停止水泵"));
     }
     return;
   }
@@ -828,7 +882,7 @@ void checkTemperature() {
     return;
   }
 
-  float currentTemp = readValidTemperature();
+  float currentTemp = lastValidTemp;
 
   if (currentTemp >= params.targetTemp) {
     heatingEnabled = false;
@@ -930,20 +984,19 @@ void checkTemperature() {
 }
 
 void updateSystemTime() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
   if (millis() - lastUpdate >= 300000) {
-    if (WiFi.status() == WL_CONNECTED) {
-      if (timeClient.update()) {
-        setTime(timeClient.getEpochTime());
-        Serial.print(F("时间同步成功: "));
-        Serial.println(formatTime(now()));
-        logEvent(F("时间同步成功: ") + formatTime(now()));
-      } else {
-        Serial.println(F("时间同步失败"));
-        logEvent(F("时间同步失败"));
-      }
+    if (timeClient.update()) {
+      setTime(timeClient.getEpochTime());
+      Serial.print(F("时间同步成功: "));
+      Serial.println(formatTime(now()));
+      logEvent(F("时间同步成功: ") + formatTime(now()));
     } else {
-      Serial.println(F("WiFi未连接，跳过时间同步"));
-      logEvent(F("WiFi未连接，跳过时间同步"));
+      Serial.println(F("时间同步失败"));
+      logEvent(F("时间同步失败"));
     }
     lastUpdate = millis();
   }
@@ -955,24 +1008,30 @@ bool isWithinAutoModeWorkingPeriod() {
   int currentMinute = minute(nowTime);
   int currentMinutes = currentHour * 60 + currentMinute;
 
-  bool anyPeriodEnabled = false;
+  bool isInAnyActivePeriod = false;
+  bool anyPeriodConfiguredAndEnabled = false;
   for (int i = 0; i < 4; i++) {
     if (params.periods[i].enabled) {
-      anyPeriodEnabled = true;
+      anyPeriodConfiguredAndEnabled = true;
       int startMinutes = params.periods[i].startHour * 60 + params.periods[i].startMinute;
       int endMinutes = params.periods[i].endHour * 60 + params.periods[i].endMinute;
       if (startMinutes <= endMinutes) {
         if (currentMinutes >= startMinutes && currentMinutes <= endMinutes) {
-          return true;
+          isInAnyActivePeriod = true;
+          break;
         }
       } else {
         if (currentMinutes >= startMinutes || currentMinutes <= endMinutes) {
-          return true;
+          isInAnyActivePeriod = true;
+          break;
         }
       }
     }
   }
-  return !anyPeriodEnabled;
+  if (!anyPeriodConfiguredAndEnabled) {
+    return true;
+  }
+  return isInAnyActivePeriod;
 }
 
 String formatTime(time_t t) {
@@ -1001,7 +1060,8 @@ void logEvent(const String &event) {
 }
 
 void flushLogBuffer() {
-  if (!params.enableLogging || logBuffer.length() == 0) return;
+  if (!params.enableLogging || logBuffer.length() == 0)
+    return;
 
   File file = SPIFFS.open(logFile, "a");
   if (!file) {
@@ -1036,45 +1096,23 @@ void flushLogBuffer() {
 void initLog() {
   if (!SPIFFS.begin()) {
     Serial.println(F("SPIFFS初始化失败"));
-    logEvent(F("SPIFFS初始化失败"));
     return;
   }
   Serial.println(F("SPIFFS初始化成功"));
-  logEvent(F("SPIFFS初始化成功"));
   File file = SPIFFS.open(logFile, "a");
   if (!file) {
     Serial.println(F("无法打开日志文件，创建新文件"));
-    logEvent(F("无法打开日志文件，创建新文件"));
     file = SPIFFS.open(logFile, "w");
   }
   file.close();
-  logEvent(F("系统启动"));
+  Serial.println(F("系统启动"));
 }
 
 void checkWiFiStatus() {
   if (millis() - lastWiFiCheckTime < wifiCheckInterval) {
     return;
   }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(F("WiFi断开，尝试重连"));
-    logEvent(F("WiFi断开，尝试重连"));
-    WiFi.reconnect();
-    unsigned long startTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
-      delay(10);
-      ESP.wdtFeed();
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println(F("WiFi重连成功"));
-      Serial.print(F("当前IP: "));
-      Serial.println(WiFi.localIP());
-      logEvent(F("WiFi重连成功，IP: ") + WiFi.localIP().toString());
-    } else {
-      Serial.println(F("WiFi重连失败"));
-      logEvent(F("WiFi重连失败"));
-    }
-  }
+  tryConnectWiFi();
   lastWiFiCheckTime = millis();
 }
 
@@ -1082,10 +1120,7 @@ void checkMqttStatus() {
   if (millis() - lastMqttCheckTime < mqttCheckInterval) {
     return;
   }
-
-  if (WiFi.status() == WL_CONNECTED && !client.connected()) {
-    reconnect();
-  }
+  tryConnectMQTT();
   lastMqttCheckTime = millis();
 }
 
@@ -1094,20 +1129,37 @@ void setup() {
   Serial.begin(115200);
   delay(3000);
   pinSetup();
-  Serial.println(F("初始化 EEPROM..."));
-  logEvent(F("EEPROM 初始化完成"));
+
   EEPROM.begin(sizeof(SystemParams));
-  Serial.println(F("EEPROM 初始化完成"));
+  Serial.println(F("EEPROM初始化完成"));
   loadParamsFromEEPROM();
   initLog();
+
   sensors.begin();
   sensors.setWaitForConversion(false);
   sensors.setResolution(9);
   if (sensors.getDeviceCount() == 0) {
     tempSensorFailed = true;
+    Serial.println(F("未找到DS18B20传感器"));
+    logEvent(F("未找到DS18B20传感器"));
+  } else {
+    oneWire.reset();
+    sensors.requestTemperatures();
+    tempConversionStarted = true;
+    tempRequestTime = millis();
   }
-  connectWiFi();
+
+  Serial.println(F("等待WiFi连接..."));
+  WiFi.begin(ssid, password);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
+    delay(100);
+    ESP.wdtFeed();
+  }
   if (WiFi.status() == WL_CONNECTED) {
+    String wifiMsg = String(F("WiFi首次连接成功，IP: ")) + WiFi.localIP().toString() + F("，设备名称: DeviceA");
+    Serial.println(wifiMsg);
+    logEvent(wifiMsg);
     timeClient.begin();
     if (timeClient.update()) {
       setTime(timeClient.getEpochTime());
@@ -1118,20 +1170,20 @@ void setup() {
       Serial.println(F("时间同步失败"));
       logEvent(F("时间同步失败"));
     }
+    initWebServer();
+    setupMQTT();
+    tryConnectMQTT(true);
+    checkTemperature();
   } else {
-    Serial.println(F("WiFi未连接，跳过时间同步"));
-    logEvent(F("WiFi未连接，跳过时间同步"));
+    Serial.println(F("WiFi连接失败，系统将重启"));
+    delay(2000);
+    ESP.restart();
   }
-  setupMQTT();
-  reconnect();
-  initWebServer();
-  checkTemperature();
 }
 
 void loop() {
   ESP.wdtFeed();
   server.handleClient();
-
   checkWiFiStatus();
   checkMqttStatus();
   checkDeviceBStatus();
@@ -1152,15 +1204,21 @@ void loop() {
 
   updateSystemTime();
 
-  if (millis() - lastTempCheck >= tempCheckInterval) {
-    if (!tempConversionStarted) {
-      sensors.requestTemperatures();
-      tempConversionStarted = true;
-    } else if (sensors.isConversionComplete()) {
-      lastValidTemp = readValidTemperature();
-      tempConversionStarted = false;
-    }
-    lastTempCheck = millis();
+  if (!tempConversionStarted) {
+    oneWire.reset();
+    sensors.requestTemperatures();
+    tempConversionStarted = true;
+    tempRequestTime = millis();
+  } else if (sensors.isConversionComplete()) {
+    lastValidTemp = readValidTemperature();
+    tempConversionStarted = false;
+    tempRequestTime = 0;
+  } else if (millis() - tempRequestTime >= 300) {
+    Serial.println(F("温度转换超时，重置并重试"));
+    logEvent(F("温度转换超时，重置并重试"));
+    oneWire.reset();
+    tempConversionStarted = false;
+    tempRequestTime = 0;
   }
 
   checkTemperature();
@@ -1178,30 +1236,9 @@ void loop() {
     lastDeviceCheckTime = millis();
   }
 
-  if (lastWiFiRetryTime != 0 && millis() - lastWiFiRetryTime >= wifiRetryInterval) {
-    Serial.println(F("WiFi断开，尝试重连"));
-    logEvent(F("WiFi断开，尝试重连"));
-    WiFi.reconnect();
-    unsigned long startTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
-      delay(10);
-      ESP.wdtFeed();
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println(F("WiFi重连成功"));
-      Serial.print(F("当前IP: "));
-      Serial.println(WiFi.localIP());
-      logEvent(F("WiFi重连成功，IP: ") + WiFi.localIP().toString());
-    } else {
-      Serial.println(F("WiFi重连失败"));
-      logEvent(F("WiFi重连失败"));
-    }
-    lastWiFiRetryTime = millis();
-  }
-
   if (millis() - lastLogFlush >= logFlushInterval) {
     flushLogBuffer();
   }
 
-  delay(10);
+  yield();
 }
