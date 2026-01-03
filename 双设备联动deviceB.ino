@@ -1,28 +1,55 @@
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
 #include <TimeLib.h>
 #include <FS.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+#include <type_traits>
+
+// 方法探测工具
+template<typename HelperT>
+struct KeepAliveHelper {
+  template<typename ClientT>
+  static auto call(ClientT& c, uint16_t s, int) -> decltype(c.setKeepAlive(s), void()) { c.setKeepAlive(s); }
+  template<typename ClientT>
+  static void call(ClientT&, uint16_t, long) {}
+};
+template<typename FuncT>
+void setKeepAliveIfSupported(FuncT &c, uint16_t seconds) { KeepAliveHelper<FuncT>::call(c, seconds, 0); }
+
+template<typename HelperT>
+struct SocketTimeoutHelper {
+  template<typename ClientT>
+  static auto call(ClientT& c, uint16_t s, int) -> decltype(c.setSocketTimeout(s), void()) { c.setSocketTimeout(s); }
+  template<typename ClientT>
+  static void call(ClientT&, uint16_t, long) {}
+};
+template<typename FuncT>
+void setSocketTimeoutIfSupported(FuncT &c, uint16_t seconds) { SocketTimeoutHelper<FuncT>::call(c, seconds, 0); }
 
 #define EEPROM_PARAMS_ADDR 128
 
 // 硬件配置
 #define RELAY_PIN 5
+#define PIN_LED 16
 #define logFile "/log.txt"
 #define maxLogSize 20000
 #define maxBufferSize 1024
 
 // 网络配置
-const char *ssid = "########";
-const char *password = "########";
+const char *ssid = "Zhou";
+const char *password = "18601982023";
 const char *mqtt_server = "192.168.2.1";
 const int mqtt_port = 1883;
 const char *mqtt_user = "admin";
 const char *mqtt_password = "public";
+
+// 静态 IP 配置
+const IPAddress local_ip(192, 168, 2, 4);
+const IPAddress gateway_ip(192, 168, 2, 1);
+const IPAddress subnet_mask(255, 255, 255, 0);
+const IPAddress dns_ip(192, 168, 2, 1);
 const char *ntp_server = "192.168.2.1";
 
 // MQTT 主题
@@ -42,22 +69,18 @@ SystemParams params;
 // 全局变量
 WiFiClient espClient;
 PubSubClient client(espClient);
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, ntp_server, 28800);
 ESP8266WebServer server(80);
 
-unsigned long lastPeerStatusTime = 0;
-bool peerRelayState = false;
-unsigned long lastWiFiCheckTime = 0;
 unsigned long lastUpdate = 0;
-unsigned long lastDeviceAStatusTime = 0;
+unsigned long lastPeerStatusTime = 0; // 统一命名，原 lastDeviceAStatusTime
 unsigned long lastMqttCheckTime = 0;
+unsigned long lastWiFiCheckTime = 0;
 unsigned long lastStatusUpdate = 0;
 unsigned long lastLogFlush = 0;
 unsigned long lastYieldTime = 0;
 unsigned long lastDeviceCheckTime = 0;
 bool lastMqttConnectedState = false;
-bool lastDeviceAOnlineState = false;
+bool lastPeerOnlineState = false; // 统一命名，原 lastDeviceAOnlineState
 bool serverStarted = false;
 bool timeSynced = false;
 String logBuffer = "";
@@ -80,6 +103,7 @@ int mqttConnectionAttempts = 0;
 const int maxMqttConnectionAttempts = 5;
 bool mqttInitialConnectionDone = false;
 bool peerOnline = false;
+bool peerRelayState = false; 
 
 // CRC32 计算
 uint32_t calcCrc32(const uint8_t *data, size_t len) {
@@ -119,6 +143,8 @@ static const char html_part1[] PROGMEM = R"rawliteral(
     .status-item > * { margin-right: 10px; }
   </style>
   <script>
+    // 标记本地是否有未保存的checkbox变更
+    window.loggingDirty = false;
     function updateData() {
       fetch('/data').then(r => r.json()).then(data => {
         document.getElementById('state').textContent = data.state;
@@ -126,7 +152,10 @@ static const char html_part1[] PROGMEM = R"rawliteral(
         document.getElementById('device-a-status').textContent = data.deviceAStatus;
         document.getElementById('device-a-status').className = data.deviceAStatus === '在线' ? 'device-a-online' : 'device-a-offline';
         document.getElementById('time').textContent = data.time;
-        document.getElementById('log-checkbox').checked = data.loggingEnabled;
+        // 只有未本地操作过checkbox时才自动刷新
+        if (!window.loggingDirty) {
+          document.getElementById('log-checkbox').checked = data.loggingEnabled;
+        }
       }).catch(error => console.error('更新状态失败:', error));
     }
     function saveLogging() {
@@ -140,6 +169,7 @@ static const char html_part1[] PROGMEM = R"rawliteral(
       .then(({ status, body }) => {
         if (status === 200) {
           alert('保存成功');
+          window.loggingDirty = false; // 保存后允许自动刷新
         } else {
           alert('保存失败: ' + body.error);
         }
@@ -169,6 +199,13 @@ static const char html_part1[] PROGMEM = R"rawliteral(
         })
         .catch(error => alert('下载日志失败: ' + error.message));
     }
+    // 监听checkbox本地变更
+    window.addEventListener('DOMContentLoaded', function() {
+      var logCheckbox = document.getElementById('log-checkbox');
+      logCheckbox.addEventListener('change', function() {
+        window.loggingDirty = true;
+      });
+    });
     setInterval(updateData, 2000);
     updateData();
   </script>
@@ -208,36 +245,29 @@ void tryConnectMQTT(bool forceAttempt = false);
 void setRelay(bool state);
 void checkPeerStatus();
 void updateSystemTime();
-String formatTime(time_t t);
+String formatUptime();
 void checkWiFiStatus();
 void checkMqttStatus();
 void initLog();
 void logEvent(String message);
 void flushLogBuffer();
 void initWebServer();
-void saveParamsToEEPROM();
-void loadParamsFromEEPROM();
 
 // 日志初始化
 void initLog() {
   if (!SPIFFS.begin()) {
     Serial.println(F("SPIFFS初始化失败"));
-    //logEvent(F("SPIFFS初始化失败"));
     return;
   }
   Serial.println(F("SPIFFS初始化成功"));
-  //logEvent(F("SPIFFS初始化成功"));
   File file = SPIFFS.open(logFile, "a");
   if (!file) {
     Serial.println(F("无法打开日志文件，创建新文件"));
-    //logEvent(F("无法打开日志文件，创建新文件"));
     file = SPIFFS.open(logFile, "w");
     if (file) {
       Serial.println(F("日志文件已创建"));
-      //logEvent(F("日志文件已创建"));
     } else {
       Serial.println(F("日志文件创建失败"));
-      //logEvent(F("日志文件创建失败"));
     }
   }
   file.close();
@@ -254,8 +284,6 @@ void saveParamsToEEPROM() {
     EEPROM.write(EEPROM_PARAMS_ADDR + i, ptr[i]);
   }
   EEPROM.commit();
-  //Serial.println(F("日志开关状态已保存: ") + String(params.enableLogging ? "开启" : "关闭"));
-  //logEvent(F("日志开关状态已保存: ") + String(params.enableLogging ? "开启" : "关闭"));
 }
 
 void loadParamsFromEEPROM() {
@@ -267,7 +295,6 @@ void loadParamsFromEEPROM() {
   if (params.marker != 0xA5 || params.version != 1) {
     params = SystemParams();
     Serial.println(F("EEPROM 加载失败，使用默认参数"));
-    //logEvent(F("EEPROM 加载失败，使用默认参数"));
     saveParamsToEEPROM();
   } else {
     uint32_t crc = params.crc;
@@ -275,11 +302,9 @@ void loadParamsFromEEPROM() {
     uint32_t calcCrc = calcCrc32((const uint8_t *)&params, sizeof(SystemParams) - sizeof(uint32_t));
     if (crc == calcCrc) {
       Serial.println(F("EEPROM 加载成功"));
-      //logEvent(F("EEPROM 加载成功"));
     } else {
       params = SystemParams();
       Serial.println(F("EEPROM 加载失败，使用默认参数"));
-      //logEvent(F("EEPROM 加载失败，使用默认参数"));
       saveParamsToEEPROM();
     }
   }
@@ -287,10 +312,9 @@ void loadParamsFromEEPROM() {
 
 // 记录日志
 void logEvent(String message) {
-  String timestamp = formatTime(now());
+  String timestamp = formatUptime();
   String logLine = timestamp + " " + message;
   if (params.enableLogging) {
-    //Serial.println(logLine); // 日志已通过logEvent输出到调试软件，无需重复Serial输出
     logBuffer += logLine + "\n";
     if (logBuffer.length() > maxBufferSize || millis() - lastLogFlush >= logFlushInterval)
       flushLogBuffer();
@@ -327,7 +351,6 @@ void flushLogBuffer() {
   }
 
   logBuffer = ""; // 清空缓冲区
-  Serial.println(F("日志写入成功"));
 }
 
 // Web 服务器初始化
@@ -337,23 +360,17 @@ void initWebServer() {
     html += String(FPSTR(html_part2));
     server.sendHeader("Cache-Control", "no-cache");
     server.send(200, "text/html; charset=utf-8", html);
-    Serial.println(F("收到GET / 请求并响应"));
-    //logEvent(F("收到GET / 请求并响应"));
   });
 
   server.on("/data", HTTP_GET, []() {
-    char webTimeBuffer[30];
-    snprintf(webTimeBuffer, sizeof(webTimeBuffer), "[%04d-%02d-%02d %02d:%02d:%02d]",
-             year(now()), month(now()), day(now()), hour(now()), minute(now()), second(now()));
+    String uptimeStr = formatUptime();
     String json = "{";
     json += "\"state\":\"" + String(params.relayState ? "ON" : "OFF") + "\",";
     json += "\"deviceAStatus\":\"" + String(peerOnline ? "在线" : "离线") + "\",";
-    json += "\"time\":\"" + String(webTimeBuffer) + "\",";
+    json += "\"time\":\"" + uptimeStr + "\",";
     json += "\"loggingEnabled\":" + String(params.enableLogging ? "true" : "false");
     json += "}";
     server.send(200, "application/json; charset=utf-8", json);
-    Serial.println(F("收到GET /data 请求并响应"));
-    //logEvent(F("收到GET /data 请求并响应"));
   });
 
   server.on("/set_log", HTTP_POST, []() {
@@ -361,7 +378,6 @@ void initWebServer() {
       String json = "{\"error\":\"缺少请求体\"}";
       server.send(400, "application/json; charset=utf-8", json);
       Serial.println(F("收到POST /set_log 请求，缺少请求体"));
-      //logEvent(F("收到POST /set_log 请求，缺少请求体"));
       return;
     }
     String body = server.arg("plain");
@@ -371,7 +387,6 @@ void initWebServer() {
       String json = "{\"error\":\"无效请求体\"}";
       server.send(400, "application/json; charset=utf-8", json);
       Serial.println(F("收到无效的POST /set_log 请求"));
-      //logEvent(F("收到无效的POST /set_log 请求"));
       return;
     }
     params.enableLogging = doc["enabled"].as<bool>();
@@ -404,8 +419,6 @@ void initWebServer() {
     server.sendHeader("Connection", "close");
     server.streamFile(file, "application/octet-stream");
     file.close();
-    Serial.println(F("收到GET /download_log 请求并响应"));
-    //logEvent(F("收到GET /download_log 请求并响应"));
   });
 
   server.on("/clear_log", HTTP_POST, []() {
@@ -419,13 +432,9 @@ void initWebServer() {
       logEvent(F("清除日志文件失败"));
       server.send(500, "text/plain; charset=utf-8", "清除日志文件失败");
     }
-    Serial.println(F("收到POST /clear_log 请求"));
-    //logEvent(F("收到POST /clear_log 请求"));
   });
 
   server.onNotFound([]() {
-    Serial.println(F("收到未知请求"));
-    //logEvent(F("收到未知请求"));
     server.send(404, "text/plain; charset=utf-8", "Not Found");
   });
 
@@ -439,49 +448,27 @@ void initWebServer() {
 void pinSetup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, HIGH); // LED默认关闭（高电平灭）
 }
 
 // WiFi 连接
 void tryConnectWiFi(bool forceAttempt) {
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnectionAttempts = 0;
-    if (!wifiInitialConnectionDone) {
-      String logMessage = F("WiFi连接成功，IP: ") + WiFi.localIP().toString() + F("，设备名称: DeviceB-") + String(ESP.getChipId());
-      Serial.println(logMessage);
-      logEvent(logMessage);
-      wifiInitialConnectionDone = true;
-    }
-    return;
-  }
+  if (WiFi.status() == WL_CONNECTED) return;
 
-  if (!forceAttempt && millis() - lastWiFiAttemptTime < wifiAttemptInterval) {
-    return;
-  }
+  if (!forceAttempt && (millis() - lastWiFiAttemptTime < wifiAttemptInterval)) return;
   lastWiFiAttemptTime = millis();
 
-  if (wifiConnectionAttempts >= maxWiFiConnectionAttempts) {
-    if (millis() - lastWiFiAttemptTime < wifiRetryInterval) {
-      return;
-    }
-    Serial.println(F("WiFi连接尝试已达最大次数，将等待较长时间后重试"));
-    logEvent(F("WiFi连接尝试已达最大次数，将等待较长时间后重试"));
-    wifiConnectionAttempts = 0;
-    return;
-  }
-
-  Serial.print(F("尝试连接WiFi (第 "));
-  Serial.print(wifiConnectionAttempts + 1);
-  Serial.println(F(" 次)..."));
-  logEvent(F("尝试连接WiFi (第 ") + String(wifiConnectionAttempts + 1) + F(" 次)..."));
-
   WiFi.begin(ssid, password);
-  wifiConnectionAttempts++;
 }
 
 // MQTT 初始化
 void setupMQTT() {
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
+  // 保活设置
+  setKeepAliveIfSupported(client, 15);
+  setSocketTimeoutIfSupported(client, 5);
   Serial.println(F("MQTT服务器配置完成"));
   logEvent(F("MQTT服务器配置完成"));
 }
@@ -495,12 +482,10 @@ void callback(char *topic, byte *payload, unsigned int length) {
   if (strcmp(topic, deviceA_status_topic) == 0) {
     if (message == "ON" || message == "OFF") {
       peerOnline = true;
-      lastDeviceAStatusTime = millis();
+      lastPeerStatusTime = millis(); // 统一命名
       peerRelayState = (message == "ON");
-      Serial.print(F("对端设备状态更新: "));
-      Serial.println(message);
-      if (peerOnline != lastDeviceAOnlineState) {
-        lastDeviceAOnlineState = peerOnline;
+      if (peerOnline != lastPeerOnlineState) { // 统一命名
+        lastPeerOnlineState = peerOnline;
         Serial.println(F("对端设备上线"));
         logEvent(F("对端设备上线"));
       }
@@ -510,69 +495,30 @@ void callback(char *topic, byte *payload, unsigned int length) {
 
 // MQTT 非阻塞重连
 void tryConnectMQTT(bool forceAttempt) {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (mqttConnectionAttempts > 0) {
-      Serial.println(F("WiFi未连接，MQTT连接尝试暂停"));
-      logEvent(F("WiFi未连接，MQTT连接尝试暂停"));
-    }
-    mqttConnectionAttempts = 0;
-    lastMqttAttemptTime = 0;
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED || client.connected()) return;
 
-  if (client.connected()) {
-    mqttConnectionAttempts = 0;
-    if (!mqttInitialConnectionDone) {
-      Serial.println(F("MQTT首次连接成功"));
-      logEvent(F("MQTT首次连接成功"));
-      mqttInitialConnectionDone = true;
-    }
-    return;
-  }
-
-  if (!forceAttempt && millis() - lastMqttAttemptTime < mqttAttemptInterval) {
-    return;
-  }
+  if (!forceAttempt && (millis() - lastMqttAttemptTime < mqttAttemptInterval)) return;
   lastMqttAttemptTime = millis();
 
-  if (mqttConnectionAttempts >= maxMqttConnectionAttempts) {
-    if (millis() - lastMqttAttemptTime < reconnectInterval) {
-      return;
-    }
-    Serial.println(F("MQTT连接尝试已达最大次数，将等待较长时间后重试"));
-    logEvent(F("MQTT连接尝试已达最大次数，将等待较长时间后重试"));
-    mqttConnectionAttempts = 0;
-  }
-
-  Serial.print(F("尝试连接MQTT (第 "));
-  Serial.print(mqttConnectionAttempts + 1);
-  Serial.println(F(" 次)..."));
-  logEvent(F("尝试连接MQTT (第 ") + String(mqttConnectionAttempts + 1) + F(" 次)..."));
-
   String clientId = "DeviceB-" + String(ESP.getChipId());
-  if (client.connect(clientId.c_str(), mqtt_user, mqtt_password, deviceB_status_topic, 0, true, "OFF")) {
-    if (!mqttInitialConnectionDone) {
-      Serial.println(F("MQTT首次连接成功"));
-      logEvent(F("MQTT首次连接成功"));
-      mqttInitialConnectionDone = true;
-    } else {
-      Serial.println(F("MQTT重连成功"));
-      logEvent(F("MQTT重连成功"));
-    }
+  if (client.connect(clientId.c_str(), mqtt_user, mqtt_password, deviceB_status_topic, 0, false, "OFF")) {
     client.subscribe(deviceA_status_topic);
-    client.publish(deviceB_status_topic, params.relayState ? "ON" : "OFF", true);
-    Serial.println(F("订阅A状态并发布B状态"));
-    logEvent(F("订阅A状态并发布B状态"));
+    client.publish(deviceB_status_topic, params.relayState ? "ON" : "OFF");
     mqttConnectionAttempts = 0;
+    lastMqttConnectedState = true; 
+    Serial.println(F("MQTT连接成功"));
+    logEvent(F("MQTT连接成功"));
   } else {
-    Serial.print(F("MQTT连接失败，状态: "));
-    Serial.println(client.state());
-    logEvent(F("MQTT连接失败，状态: ") + String(client.state()));
     mqttConnectionAttempts++;
+    if (mqttConnectionAttempts >= 5) {
+      Serial.println(F("MQTT失败次数过多，系统重启..."));
+      logEvent(F("MQTT失败次数过多，系统重启..."));
+      delay(1000);
+      ESP.restart();
+    }
   }
 }
 
-// 设置继电器
 void setRelay(bool state) {
   if (params.relayState != state) {
     digitalWrite(RELAY_PIN, state);
@@ -592,9 +538,9 @@ void checkPeerStatus() {
   const unsigned long deviceACheckInterval = 100;
   if (millis() - lastDeviceACheck >= deviceACheckInterval) {
     unsigned long timeout = params.relayState ? 3500 : 30000;
-    if (millis() - lastDeviceAStatusTime >= timeout && peerOnline) {
+    if (millis() - lastPeerStatusTime >= timeout && peerOnline) {
       peerOnline = false;
-      lastDeviceAOnlineState = peerOnline;
+      lastPeerOnlineState = peerOnline;
       Serial.println(F("对端设备掉线"));
       logEvent(F("对端设备掉线"));
     }
@@ -602,50 +548,24 @@ void checkPeerStatus() {
   }
 }
 
-// 更新系统时间
+// 更新系统时间 (仅累加)
 void updateSystemTime() {
-  if (millis() - lastUpdate >= 300000) {
-    if (WiFi.status() == WL_CONNECTED) {
-      if (timeClient.update()) {
-        lastValidTime = timeClient.getEpochTime();
-        setTime(lastValidTime);
-        timeSynced = true;
-        Serial.println(F("时间同步成功: ") + formatTime(now()));
-        logEvent(F("时间同步成功: ") + formatTime(now()));
-      } else {
-        Serial.println(F("时间同步失败"));
-        logEvent(F("时间同步失败"));
-        if (lastValidTime == 0) {
-          lastValidTime = millis() / 1000;
-        } else {
-          lastValidTime += (millis() - lastUpdate) / 1000;
-        }
-        setTime(lastValidTime);
-        timeSynced = false;
-        Serial.println(F("使用计数器时间: ") + formatTime(now()));
-        logEvent(F("使用计数器时间: ") + formatTime(now()));
-      }
-    } else {
-      Serial.println(F("WiFi未连接，跳过时间同步"));
-      logEvent(F("WiFi未连接，跳过时间同步"));
-      if (lastValidTime == 0) {
-        lastValidTime = millis() / 1000;
-      } else {
-        lastValidTime += (millis() - lastUpdate) / 1000;
-      }
-      setTime(lastValidTime);
-      timeSynced = false;
-      Serial.println(F("使用计数器时间: ") + formatTime(now()));
-      logEvent(F("使用计数器时间: ") + formatTime(now()));
-    }
-    lastUpdate = millis();
-  }
+  // B 端不再同步 NTP，仅使用系统 ticks
 }
 
-// 格式化时间
-String formatTime(time_t t) {
-  char buffer[30];
-  snprintf(buffer, sizeof(buffer), "[%04d-%02d-%02d %02d:%02d:%02d]", year(t), month(t), day(t), hour(t), minute(t), second(t));
+// 格式化运行时长
+String formatUptime() {
+  unsigned long seconds = millis() / 1000;
+  unsigned long days = seconds / 86400UL;
+  unsigned long rem = seconds % 86400UL;
+  unsigned long hours = rem / 3600UL;
+  rem %= 3600UL;
+  unsigned long minutes = rem / 60UL;
+  unsigned long secs = rem % 60UL;
+
+  char buffer[40];
+  snprintf(buffer, sizeof(buffer), "[运行 %lud %02lu:%02lu:%02lu]", days, hours,
+           minutes, secs);
   return String(buffer);
 }
 
@@ -676,51 +596,72 @@ void setup() {
   initLog();
   loadParamsFromEEPROM();
   Serial.println(F("系统启动"));
-  //logEvent(F("系统启动"));
+
+  // 稳定配置
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.config(local_ip, gateway_ip, subnet_mask, dns_ip); // 固定 IP
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  
   Serial.println(F("等待WiFi连接..."));
-  //logEvent(F("等待WiFi连接..."));
   WiFi.begin(ssid, password);
   unsigned long wifiStart = millis();
+  static unsigned long ledTimer = 0;
+  static bool ledState = false;
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 30000) {
+    // 启动阶段WiFi未连上时LED闪烁
+    if (millis() - ledTimer > 500) {
+      ledTimer = millis();
+      ledState = !ledState;
+      digitalWrite(PIN_LED, ledState ? LOW : HIGH); // 闪烁
+    }
     delay(100);
     ESP.wdtFeed();
   }
   if (WiFi.status() == WL_CONNECTED) {
-    String wifiMsg = String(F("WiFi首次连接成功，IP: ")) + WiFi.localIP().toString() + F("，设备名称: DeviceB-") + String(ESP.getChipId());
-    Serial.println(wifiMsg);
-    logEvent(wifiMsg);
-    timeClient.begin();
-    if (timeClient.update()) {
-      lastValidTime = timeClient.getEpochTime();
-      setTime(lastValidTime);
-      timeSynced = true;
-      Serial.println(F("初始时间同步成功: ") + formatTime(now()));
-      logEvent(F("初始时间同步成功: ") + formatTime(now()));
-    } else {
-      Serial.println(F("时间同步失败"));
-      logEvent(F("时间同步失败"));
-      lastValidTime = millis() / 1000;
-      setTime(lastValidTime);
-      timeSynced = false;
-      Serial.println(F("使用计数器时间: ") + formatTime(now()));
-      logEvent(F("使用计数器时间: ") + formatTime(now()));
-    }
-    initWebServer();
-    setupMQTT();
-    tryConnectMQTT(true);
+    digitalWrite(PIN_LED, LOW);
   } else {
-    Serial.println(F("WiFi连接失败，系统将重启"));
-    logEvent(F("WiFi连接失败，系统将重启"));
-    delay(2000);
-    ESP.restart();
+    Serial.println(F("WiFi未能在启动阶段连接，将在后台持续尝试..."));
+  }
+
+  // 无论初始WiFi是否成功，都初始化以便后续自动工作
+  initWebServer();
+  setupMQTT();
+  if (WiFi.status() == WL_CONNECTED) {
+    tryConnectMQTT(true);
   }
 }
 
 // 主循环
 void loop() {
   ESP.wdtFeed();
+  // 16脚LED作为WiFi指示灯：连网常亮，断网闪烁，连接中常灭
+  static unsigned long ledTimer = 0;
+  static bool ledState = false;
   if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(PIN_LED, LOW); // 常亮（低电平亮）
+  } else if (WiFi.SSID() && WiFi.status() == WL_DISCONNECTED) {
+    // 断网时闪烁
+    if (millis() - ledTimer > 500) {
+      ledTimer = millis();
+      ledState = !ledState;
+      digitalWrite(PIN_LED, ledState ? LOW : HIGH); // 闪烁
+    }
+  } else {
+    // 连接过程中常灭（高电平）
+    digitalWrite(PIN_LED, HIGH);
+  }
+  static bool lastWiFiConnected = false;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!lastWiFiConnected) {
+      Serial.print(F("WiFi已连接，IP地址: "));
+      Serial.println(WiFi.localIP());
+      lastWiFiConnected = true;
+    }
     server.handleClient();
+  } else {
+    lastWiFiConnected = false;
   }
   checkWiFiStatus();
   checkMqttStatus();
@@ -728,7 +669,7 @@ void loop() {
 
   bool currentMqttConnected = client.connected();
   if (currentMqttConnected != lastMqttConnectedState) {
-    Serial.println(currentMqttConnected ? F("MQTT连接恢复") : F("MQTT未连接，跳过client.loop()"));
+    Serial.println(currentMqttConnected ? F("MQTT连接恢复") : F("MQTT断开连接，跳过client.loop()"));
     logEvent(currentMqttConnected ? F("MQTT连接恢复") : F("MQTT断开连接"));
     lastMqttConnectedState = currentMqttConnected;
   }
@@ -747,15 +688,7 @@ void loop() {
     }
     lastStatusUpdate = millis();
   }
-  if (!params.relayState && millis() - lastDeviceCheckTime >= deviceCheckInterval) {
-    if (millis() - lastDeviceAStatusTime >= 30000) {
-      peerOnline = false;
-      lastDeviceAOnlineState = peerOnline;
-      Serial.println(F("对端设备掉线（周期检查）"));
-      logEvent(F("对端设备掉线（周期检查）"));
-    }
-    lastDeviceCheckTime = millis();
-  }
+  // 移除每60秒一次的冗余周期检查
   if (millis() - lastLogFlush >= logFlushInterval) {
     flushLogBuffer();
   }
